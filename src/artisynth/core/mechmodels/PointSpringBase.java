@@ -40,6 +40,8 @@ import artisynth.core.modelbase.ComponentUtils;
 import artisynth.core.modelbase.HasNumericState;
 import artisynth.core.modelbase.IsLineComponent;
 import artisynth.core.modelbase.ModelComponent;
+import artisynth.core.modelbase.PropertyChangeEvent;
+import artisynth.core.modelbase.PropertyChangeListener;
 import artisynth.core.modelbase.HasPosition;
 import artisynth.core.modelbase.RenderableComponent;
 import artisynth.core.modelbase.RenderableComponentBase;
@@ -50,7 +52,7 @@ import artisynth.core.util.ScalableUnits;
  */
 public abstract class PointSpringBase extends Spring
    implements RenderableComponent, ScalableUnits,
-              HasNumericState, IsLineComponent {
+              HasNumericState, IsLineComponent, PropertyChangeListener {
 
    // saved line color and style properties for when the spring is being
    // rendered using disabled versions of these properties as returned by
@@ -71,7 +73,13 @@ public abstract class PointSpringBase extends Spring
    // if myMaterial implements HasNumericState, myStateMat is set to its value
    // as a cached reference for use in implementing HasNumericState
    protected HasNumericState myStateMat;
-   
+   // version number for the state structure of this spring, exclusive of
+   // that of myStateMat. Combined with the version of myStateMat to
+   // implement getStateVersion().
+   protected int myStateVersion = 0;
+   // transient flag set by setQuasiStaticResponse()
+   protected boolean myQuasiStaticResponse = false;
+
    private static double DEFAULT_REST_LENGTH = 0;
    
    protected double myRestLength = DEFAULT_REST_LENGTH;
@@ -240,6 +248,15 @@ public abstract class PointSpringBase extends Spring
       T newMat = (T)MaterialBase.updateMaterial (
          this, "material", myMaterial, mat);
       myMaterial = newMat;
+      if (myStateMat != null || mat instanceof HasNumericState) {
+         // state structure may have changed. Increment myStateVersion so that
+         // getStateVersion(), which adds in the material state version, is
+         // guaranteed to increase.
+         myStateVersion += 1;
+         if (myStateMat != null) {
+            myStateVersion += myStateMat.getStateVersion();
+         }
+      }
       if (mat instanceof HasNumericState) {
          // use getMaterial() since mat may have been copied
          myStateMat = (HasNumericState)getMaterial();
@@ -248,12 +265,51 @@ public abstract class PointSpringBase extends Spring
          myStateMat = null;
       }     
       // issue change event in case solve matrix symmetry or state has changed:
-      MaterialChangeEvent mce = 
+      MaterialChangeEvent mce =
          MaterialBase.symmetryOrStateChanged ("material", newMat, oldMat);
       if (mce != null) {
          notifyParentOfChange (mce);
       }
+      if (myQuasiStaticResponse) {
+         if (oldMat != null && oldMat != newMat) {
+            oldMat.setQuasiStaticResponse (false);
+         }
+         if (newMat != null) {
+            newMat.setQuasiStaticResponse (true);
+         }
+      }
       //return newMat;
+   }
+
+   /**
+    * Enables or disables quasi-static excitation response for this spring,
+    * by passing the request to its effective material. This is a transient
+    * mode used by the inverse tracking controller when forming its excitation
+    * response matrices; see {@link
+    * ExcitationComponent#setQuasiStaticResponse}. For subclasses that
+    * implement {@link ExcitationComponent}, this overrides the default
+    * implementation.
+    *
+    * <p>This feature is still experimental.
+    *
+    * @param enable if {@code true}, enables quasi-static response
+    */
+   public void setQuasiStaticResponse (boolean enable) {
+      myQuasiStaticResponse = enable;
+      AxialMaterial mat = getEffectiveMaterial();
+      if (mat != null) {
+         mat.setQuasiStaticResponse (enable);
+      }
+   }
+
+   /**
+    * Queries whether quasi-static excitation response is enabled for this
+    * spring, as described in {@link #setQuasiStaticResponse}.
+    *
+    * @return {@code true} if quasi-static response is enabled
+    */
+   public boolean getQuasiStaticResponse() {
+      return myQuasiStaticResponse;
    }
 
    public AxialMaterial getEffectiveMaterial() {
@@ -978,6 +1034,17 @@ public abstract class PointSpringBase extends Spring
       }
    }   
 
+   // PropertyChangeListener interface:
+
+   public void propertyChanged (PropertyChangeEvent e) {
+      if (e instanceof MaterialChangeEvent) {
+         MaterialChangeEvent mce = (MaterialChangeEvent)e;
+         if (mce.stateOrSymmetryChanged()) {
+            notifyParentOfChange (new MaterialChangeEvent (this, mce));  
+         }
+      }     
+   }
+
    /* --- Begin HasNumericState interface --- */
 
    /**
@@ -991,12 +1058,11 @@ public abstract class PointSpringBase extends Spring
     * {@inheritDoc}
     */
    public int getStateVersion() {
+      int version = myStateVersion;
       if (myStateMat != null) {
-         return myStateMat.getStateVersion();
+         version += myStateMat.getStateVersion();
       }
-      else {
-         return 0;
-      }
+      return version;
    }
 
    /**

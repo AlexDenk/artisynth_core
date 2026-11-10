@@ -287,10 +287,10 @@ public class QPSolver {
          for (QPConstraintTerm term : constraintTerms) {
             if (term.isEnabled()) {
                if (term.getType() == QPConstraintTerm.Type.EQUALITY) {
-                  rowEq += term.getTerm (myAeq, myBeq, rowEq, t0, t1);
+                  rowEq = term.getTerm (myAeq, myBeq, rowEq, t0, t1);
                }
                else if (term.getType() == QPConstraintTerm.Type.INEQUALITY) {
-                  rowIneq += term.getTerm (myA, myB, rowIneq, t0, t1);
+                  rowIneq = term.getTerm (myA, myB, rowIneq, t0, t1);
                }
             }
          }

@@ -149,6 +149,11 @@ public class TrackingController extends ControllerBase
    public static boolean DEFAULT_NORMALIZE_COST_TERMS = true;
    protected boolean myNormalizeCostTerms = DEFAULT_NORMALIZE_COST_TERMS;
 
+   // compute the excitation response using the quasi-static response of the
+   // exciters (experimental)
+   public static boolean DEFAULT_QUASI_STATIC_RESPONSE = true;
+   protected boolean myQuasiStaticResponse = DEFAULT_QUASI_STATIC_RESPONSE;
+
    // default bounds for the excitation values
    public static DoubleInterval DEFAULT_EXCITATION_BOUNDS =
       new DoubleInterval ("[-inf,inf])");
@@ -156,10 +161,10 @@ public class TrackingController extends ControllerBase
       new DoubleInterval(DEFAULT_EXCITATION_BOUNDS);
    private PropertyMode myExcitationBoundsMode = PropertyMode.Inherited;
 
-   private static boolean DEFAULT_COMPUTE_INCREMENTALLY = false;
+   private static boolean DEFAULT_COMPUTE_INCREMENTALLY = true;
    private boolean myComputeIncrementally = DEFAULT_COMPUTE_INCREMENTALLY;
    
-   static boolean DEFAULT_REFACTOR_FOR_INCREMENTAL = true;
+   static boolean DEFAULT_REFACTOR_FOR_INCREMENTAL = false;
    
    private static boolean DEFAULT_CONFIG_EXCITATION_COLORING = true;
    private boolean myConfigExcitationColoring = 
@@ -191,7 +196,6 @@ public class TrackingController extends ControllerBase
 
    protected L2RegularizationTerm myL2RegularizationTerm = null;
    protected BoundsTerm myBoundsTerm = null;
-   //protected NonuniformBoundsTerm myOffsetBoundsTerm = null;
    
    // contains child components and implements CompositeComponent methods
    protected ComponentListImpl<ModelComponent> myComponents;
@@ -248,8 +252,13 @@ public class TrackingController extends ControllerBase
          DEFAULT_USE_KKT_FACTORIZATION);
       myProps.add(
          "normalizeCostTerms",
-         "normalize contribution of each cost terms using a frobenius norm",
+         "normalize the contribution of each cost term",
          DEFAULT_NORMALIZE_COST_TERMS);
+      myProps.add(
+         "quasiStaticResponse",
+         "compute excitation response assuming exciter internal states "+
+         "reach equilibrium within each step",
+         DEFAULT_QUASI_STATIC_RESPONSE);
       myProps.addInheritable (
          "excitationBounds", "bounds for the computed excitations",
          DEFAULT_EXCITATION_BOUNDS);
@@ -466,11 +475,20 @@ public class TrackingController extends ControllerBase
 
    /**
     * Enables timestep scaling. If enabled, then the {@code H} matrix and
-    * {@code b} vector of the motion and force tracking terms are scaled by
-    * {@code 1/h}, where {@code h} is the simulation step size, thus making
-    * these terms independent of the step size.
-    * <p>
-    * Timestep scaling is disabled by default.
+    * {@code b} vector of the motion target term and constraint force term are
+    * scaled by {@code 1/h}, where {@code h} is the simulation step size.
+    * Since {@code H} (the velocity change per unit excitation over one step)
+    * is roughly proportional to {@code h}, this converts these terms from
+    * velocity errors into acceleration errors, making their size relative to
+    * the regularization terms approximately independent of the step size.
+    *
+    * <p>Timestep scaling is only applied when cost term normalization is
+    * disabled (see {@link #setNormalizeCostTerms}).
+    * Otherwise, normalization already removes the dependence on step size,
+    * and further scaling would simply weaken the regularization terms by a
+    * factor of {@code h^2}.
+    *
+    * <p>Timestep scaling is disabled by default.
     * 
     * @param enable if {@code true}, enables timestep scaling
     */
@@ -489,12 +507,15 @@ public class TrackingController extends ControllerBase
    }
 
    /**
-    * Enables incremental computation. If enabled, then excitations are
-    * computed incrementally (as opposed to holistically) at each time step.
-    * The various QPTerms used by the controller should adjust their
-    * contributions to the quadratic program to reflect an incemental
-    * computation instead of a holistic one.  Incremental computation is
-    * disabled by default.
+    * Enables incremental computation. If enabled, then the quadratic program
+    * solved at each time step determines the change in excitations {@code
+    * Delta a}, relative to the excitations at the start of the step, rather
+    * than the excitations {@code a} themselves, using a linearization of the
+    * system forces about the current excitations. This allows the forces to
+    * depend nonlinearly on the excitations, as they do for equilibrium muscle
+    * models. The various QPTerms used by the controller should adjust their
+    * contributions to the quadratic program accordingly. Incremental
+    * computation is enabled by default.
     * 
     * @param enable if {@code true}, enables incremental computation
     */
@@ -519,8 +540,9 @@ public class TrackingController extends ControllerBase
    /**
     * For incremental computation, specifies whether or not the solve matrix
     * should be refactored when computing each excitation response. Refactoring
-    * may give more accurate solutions, but at an increased computation cost
-    * that is proportional to the number of exciters.
+    * may give slightly more accurate solutions, but at an increased
+    * computation cost that is proportional to the number of exciters.
+    * Refactoring is disabled by default.
     * 
     * @param enable if {@code true}, the solve matrix will be refactored for
     * each excitation response.
@@ -614,9 +636,9 @@ public class TrackingController extends ControllerBase
    public void setNormalizeH (boolean enable) {
       setNormalizeCostTerms (enable);
    }
-   
+
    /**
-    * Queries whether or not cost terms normalization is enabled, as described
+    * Queries whether or not cost term normalization is enabled, as described
     * in {@link #setNormalizeCostTerms(boolean)}.
     *
     * @return {@code true} if cost term normalization is enabled
@@ -626,18 +648,102 @@ public class TrackingController extends ControllerBase
    }
 
    /**
-    * Enables or disbles normalization of the cost terms in the quadratic
-    * program. Normalization is done by dividing each term's {@code Q} matrix
-    * and {@code b} vector by the Frobenius norm of {@code Q}, <i>before</i>
-    * the term's weight is applied. This helps ensure that the cost term
-    * weights more inititively described the tradeoffs between terms.
+    * Enables or disables normalization of the cost terms in the quadratic
+    * program. Normalization scales each term's {@code Q} matrix (and
+    * associated {@code p} vector) so that {@code Q} has unit trace,
+    * <i>before</i> the term's weight is applied. This helps the term weights
+    * describe the tradeoffs between terms independently of the step size,
+    * physical units, and model masses. Since a term with a low-rank {@code Q}
+    * (such as a motion term with fewer target coordinates than exciters)
+    * concentrates this trace into fewer directions, the effective ratio
+    * between weights still depends on the numbers of targets and exciters.
+    * When normalization is enabled, the motion and force term weights enter
+    * the cost squared; otherwise, all weights enter the cost linearly.
+    *
+    * <p>Timestep scaling (see {@link #setUseTimestepScaling}) is only
+    * applied when normalization is disabled.
     *
     * <p>Cost term normalization is enabled by default.
-    * 
+    *
     * @param enable if <code>true</code>, enables normalization
     */
    public void setNormalizeCostTerms (boolean enable) {
       myNormalizeCostTerms = enable;
+   }
+
+   /**
+    * Returns the normalization scale factor for a cost term whose {@code Q}
+    * matrix is the diagonal exciter weight matrix {@code Wa}: {@code
+    * 1/tr(Wa)} if normalization is enabled and 1 otherwise.
+    */
+   double exciterWeightNormalization() {
+      if (myNormalizeCostTerms) {
+         double sum = 0;
+         for (int i=0; i<myExciters.size(); i++) {
+            sum += myExciters.get(i).getWeight();
+         }
+         return sum != 0 ? 1/sum : 1;
+      }
+      return 1;
+   }
+
+   /**
+    * Returns the normalization scale factor for a cost term whose {@code Q}
+    * matrix is the n x n identity: 1/n if normalization is enabled and 1
+    * otherwise.
+    */
+   double identityNormalization (int n) {
+      return (myNormalizeCostTerms && n > 0) ? 1/(double)n : 1;
+   }
+
+   /**
+    * Returns the factor by which a cost term's weight {@code w} should scale
+    * its {@code H} matrix and {@code b} vector. If normalization is enabled,
+    * this is {@code w} (legacy behavior, with {@code w} entering the cost
+    * squared); otherwise it is {@code sqrt(w)}, so that {@code w} enters the
+    * cost linearly.
+    */
+   double costTermWeightScale (double w) {
+      return myNormalizeCostTerms ? w : Math.sqrt(w);
+   }
+
+   /**
+    * Queries whether quasi-static excitation response is enabled, as
+    * described in {@link #setQuasiStaticResponse(boolean)}.
+    *
+    * @return {@code true} if quasi-static response is enabled
+    */
+   public boolean getQuasiStaticResponse() {
+      return myQuasiStaticResponse;
+   }
+
+   /**
+    * Enables or disables quasi-static excitation response. When enabled, the
+    * controller enables quasi-static response for each of its exciters (see
+    * {@link ExcitationComponent#setQuasiStaticResponse}) while computing the
+    * excitations, and disables it afterwards. The excitation response is then
+    * computed assuming that internal states through which excitation acts,
+    * such as the fibre length of a compliant tendon muscle, reach equilibrium
+    * within each time step. Otherwise, for muscles with contraction dynamics,
+    * the one-step response to excitation can be strongly attenuated at small
+    * step sizes, resulting in noisy excitations.
+    *
+    * <p>Quasi-static response is enabled by default. This feature is
+    * still experimental.
+    *
+    * @param enable if {@code true}, enables quasi-static response
+    */
+   public void setQuasiStaticResponse (boolean enable) {
+      myQuasiStaticResponse = enable;
+   }
+
+   /**
+    * Enables or disables quasi-static response for all exciters.
+    */
+   private void setExcitersQuasiStatic (boolean enable) {
+      for (int i=0; i<numExciters(); i++) {
+         getExciter(i).setQuasiStaticResponse (enable);
+      }
    }
    
    /**
@@ -1017,21 +1123,32 @@ public class TrackingController extends ControllerBase
          myMech.getState (saveState);
       }
 
-      updateCostTerms (t0, t1);
-
-      // collect cost and constraint terms from among the child components
-      ArrayList<QPCostTerm> costs = new ArrayList<>();
-      ArrayList<QPConstraintTerm> constraints = new ArrayList<>();
-      costs.addAll (getCostTerms());
-      constraints.addAll (getInequalityConstraints());
-      constraints.addAll (getEqualityConstraints());
-
-      if (myMotionTerm.isEnabled()) {
-         myMotionTerm.updateHb (this, t0, t1);
+      VectorNd x;
+      if (myQuasiStaticResponse) {
+         setExcitersQuasiStatic (true);
       }
+      try {
+         updateCostTerms (t0, t1);
 
-      // solve for the excitations, given the cost and constraint terms
-      VectorNd x = myQPSolver.solve (costs, constraints, numExciters(), t0, t1);
+         // collect cost and constraint terms from among the child components
+         ArrayList<QPCostTerm> costs = new ArrayList<>();
+         ArrayList<QPConstraintTerm> constraints = new ArrayList<>();
+         costs.addAll (getCostTerms());
+         constraints.addAll (getInequalityConstraints());
+         constraints.addAll (getEqualityConstraints());
+
+         if (myMotionTerm.isEnabled()) {
+            myMotionTerm.updateHb (this, t0, t1);
+         }
+
+         // solve for the excitations, given the cost and constraint terms
+         x = myQPSolver.solve (costs, constraints, numExciters(), t0, t1);
+      }
+      finally {
+         if (myQuasiStaticResponse) {
+            setExcitersQuasiStatic (false);
+         }
+      }
       if (myComputeIncrementally) {
          // VectorNd deltaActivations = myCostFunction.solve (t0, t1);
          // myExcitations.add (deltaActivations);
@@ -2658,6 +2775,7 @@ public class TrackingController extends ControllerBase
       NumericState nstate = castToNumericState(state);
       nstate.resetOffsets();
       getExcitationState (nstate);
+      myMotionTerm.getHistoryState (nstate, /*initial=*/false);
       // save point and frame targets as state, mainly for rendering purposes:
       for (Point p : myMotionTerm.myTargetPoints) {
          p.getState (nstate);
@@ -2693,6 +2811,7 @@ public class TrackingController extends ControllerBase
       nstate.resetOffsets();
       // Get number of stored excitation values
       setExcitationState (nstate);
+      myMotionTerm.setHistoryState (nstate);
       for (Point p : myMotionTerm.myTargetPoints) {
          p.setState (nstate);
       }
@@ -2743,6 +2862,7 @@ public class TrackingController extends ControllerBase
          }        
       }
       getExcitationState (nstate);
+      myMotionTerm.getHistoryState (nstate, /*initial=*/true);
       nstate.addDataFrame (null);
       
       for (Point p : myMotionTerm.myTargetPoints) {
