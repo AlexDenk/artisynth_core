@@ -24,12 +24,12 @@ import maspack.solvers.DantzigQPSolver.Status;
  * program it handed over, and re-solves without the equality constraints when
  * the two disagree. The check is on the point rather than on the status,
  * because the status alone is not enough: the equality-constrained path
- * reduces to a linear complementarity problem whose matrix is built from the
- * KKT system {@code [Q Aeq'; Aeq 0]}. That system is a saddle point and
- * therefore indefinite, while the complementarity solver assumes a positive
- * semidefinite matrix, so a solve can terminate on a basis that satisfies
- * neither the equalities nor the bounds and still report
- * {@link Status#SOLVED}. Two conditions trigger a retry:
+ * factors the matrix {@code [Q Aeq'; -Aeq 0]}, which is singular when the
+ * rows of Aeq are linearly dependent and ill-conditioned when they nearly
+ * are, as with several motion targets on one rigid body. Such a solve, and
+ * one whose equalities cannot be met within the bounds, can fail outright or
+ * report {@link Status#SOLVED} for a point far outside the bounds. Two
+ * conditions trigger a retry:
  *
  * <OL>
  * <LI>a solve that returned nothing. The underlying solver leaves its
